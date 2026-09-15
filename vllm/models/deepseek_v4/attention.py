@@ -465,12 +465,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                _wkv_layer = compressor.fused_wkv_wgate
+                _w = getattr(_wkv_layer, "weight", None)
+                if _w is None:
+                    # Quantized (EXL3) layer: its forward computes
+                    # hidden @ W.T — the same projection.
+                    return _wkv_layer(hidden_states).to(torch.float32)
                 output = maybe_sm70_dsv4_fp16_gemv(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight,
+                    _w,
                     torch.float32,
                     getattr(
-                        compressor.fused_wkv_wgate,
+                        _wkv_layer,
                         "_sm70_dsv4_fp13_weight",
                         None,
                     ),
@@ -479,7 +485,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     return output
                 return torch.mm(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
+                    _w.T,
                     out_dtype=torch.float32,
                 )
 
@@ -506,12 +512,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                _wkv_layer = indexer.compressor.fused_wkv_wgate
+                _w = getattr(_wkv_layer, "weight", None)
+                if _w is None:
+                    # Quantized (EXL3) layer: its forward computes
+                    # hidden @ W.T — the same projection.
+                    return _wkv_layer(hidden_states).to(torch.float32)
                 output = maybe_sm70_dsv4_fp16_gemv(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight,
+                    _w,
                     torch.float32,
                     getattr(
-                        indexer.compressor.fused_wkv_wgate,
+                        _wkv_layer,
                         "_sm70_dsv4_fp13_weight",
                         None,
                     ),
@@ -520,7 +532,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     return output
                 return torch.mm(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    _w.T,
                     out_dtype=torch.float32,
                 )
 
