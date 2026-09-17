@@ -1114,7 +1114,7 @@ class Qwen4ExpForCausalLM(
             quant_config=(
                 self.quant_config
                 if self.quant_config is not None
-                and self.quant_config.get_name() == "gguf"
+                and self.quant_config.get_name() in ("gguf", "exl3")
                 else None
             ),
             prefix=maybe_prefix(prefix, "lm_head"),
