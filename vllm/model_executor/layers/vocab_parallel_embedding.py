@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import glob
+import json
+import os
+
+from safetensors import safe_open
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -115,6 +120,104 @@ def _is_sm70_dflash2_qpn8_rerank_eligible(layer):
 
 def _sm70_lm_head_top1_default():
     return not graph_policy().compile_graph
+
+
+def _load_native_lm_head_codes(
+    layer: torch.nn.Module,
+    model_dir: str,
+) -> bool:
+    """Load native NVFP4 lm_head codes/scales from the served checkpoint.
+
+    A modelopt NVFP4 checkpoint ships the lm_head already quantized:
+    ``lm_head.weight`` [V, K/2] uint8 (two e2m1 codes per byte, low nibble
+    first), ``lm_head.weight_scale`` [V, K/16] float8_e4m3, and a scalar
+    ``lm_head.weight_scale_2`` global scale. Loading them verbatim skips
+    both the fp16 weight copy (2.4 GiB -> 0.6 GiB for a 248k vocab) and
+    any requantization pass.
+
+    Loads this rank's vocab shard only: rows [rank*n, (rank+1)*n) of the
+    checkpoint tensors, where n = num_embeddings_per_partition. Falls
+    back cleanly (returns False) when the checkpoint has no native head,
+    the shapes mismatch (padded vocab), or the shard range exceeds the
+    source rows — the caller then keeps the fp16 path.
+
+    Sets on success:
+      layer._sm70_native_lm_codes   uint8 [n, K/2]
+      layer._sm70_native_lm_scales  uint8 view of fp8 [n, K/16]
+      layer._sm70_native_lm_gscale  float
+      layer._sm70_native_lm_ready   True
+    """
+    import glob
+    import json
+    import os
+
+    try:
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        return False
+
+    weight = getattr(layer, "weight", None)
+    if weight is None or weight.dim() != 2:
+        return False
+    n, k = weight.shape
+    if n < 1 or k % 128 != 0:
+        return False
+
+    # Locate the shard holding the native head via the index, else scan.
+    idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+    shard: str | None = None
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path) as f:
+                wm = json.load(f)["weight_map"]
+            shard = wm.get("lm_head.weight")
+        except Exception:
+            shard = None
+    if shard is None:
+        for cand in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+            try:
+                with safe_open(cand, framework="pt") as f:
+                    if "lm_head.weight" in f.keys():
+                        shard = cand
+                        break
+            except Exception:
+                continue
+    if shard is None:
+        return False
+
+    path = os.path.join(model_dir, shard)
+    try:
+        with safe_open(path, framework="pt") as f:
+            keys = set(f.keys())
+            if "lm_head.weight" not in keys or "lm_head.weight_scale" not in keys:
+                return False
+            total = f.get_slice("lm_head.weight").get_shape()[0]
+            off = rank * n
+            if off + n > total:
+                logger.warning_once(
+                    "Native lm_head shard [%d:%d] exceeds source rows %d "
+                    "(padded vocab?); keeping fp16 head.",
+                    off, off + n, total)
+                return False
+            codes = f.get_tensor("lm_head.weight")[off:off + n]
+            scales = f.get_tensor("lm_head.weight_scale")[off:off + n]
+            g2 = f.get_tensor("lm_head.weight_scale_2")
+    except Exception:
+        logger.warning_once("Native lm_head read failed; keeping fp16 head.")
+        return False
+
+    dev = weight.device
+    layer._sm70_native_lm_codes = codes.to(torch.uint8).to(dev).contiguous()
+    layer._sm70_native_lm_scales = (
+        scales.view(torch.uint8).to(dev).contiguous())
+    layer._sm70_native_lm_gscale = float(g2.float().item())
+    layer._sm70_native_lm_ready = True
+    logger.info_once(
+        "Native NVFP4 lm_head loaded: rows %d..%d of %d, %.0f MiB packed "
+        "(gscale %.4e).", off, off + n, total,
+        layer._sm70_native_lm_codes.numel() / 2**20,
+        layer._sm70_native_lm_gscale)
+    return True
 
 
 def __getattr__(name):
