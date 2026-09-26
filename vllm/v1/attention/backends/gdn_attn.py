@@ -1367,8 +1367,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
+            # Chain-MTP reuses the ddtree all-spec fast build (identical
+            # construction for linear chains; skips the nonzero/mask storm
+            # in build_gdn_spec_decode_state_contract). Env-gated for A/B.
+            chain_fast = (
+                os.getenv("VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD", "0") == "1"
+                and bool(torch.all(spec_sequence_masks_cpu).item())
+            )
             pure_ddtree_spec_fast_path_candidate = (
-                ddtree_parent_ids is not None
+                (ddtree_parent_ids is not None or chain_fast)
                 and num_spec_decodes > 0
                 and non_spec_query_lens_cpu.size(0) == num_zero_len
             )
