@@ -293,6 +293,10 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 // Standalone-load export: torch's cpp_extension load() requires the
 // module init symbol when building this file outside the wheel build.
+// Guarded: the CMake sidecar target provides its own module entry via
+// USE_SABI and does not define TORCH_EXTENSION_NAME.
+#ifdef TORCH_EXTENSION_NAME
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &sm70_nvfp4_simt_argmax_out);
 }
+#endif
