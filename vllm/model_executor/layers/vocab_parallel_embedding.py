@@ -105,6 +105,13 @@ def _maybe_sm70_lm_head_forward(layer, x, bias=None):
 
 
 def _maybe_sm70_lm_head_top1(layer, x, bias=None):
+    # Native fused path first: consumes the checkpoint's own packed codes
+    # with no logits materialization. Falls through to the fp16 paths on
+    # any miss (flag off, buffers absent, op missing, shape mismatch).
+    native = _maybe_sm70_native_lm_head_top1(layer, x)
+    if native is not None:
+        return native
+
     state = _prepared_sm70_lm_head_state(layer)
     if state is None:
         return None
@@ -239,6 +246,46 @@ def _load_native_lm_head_codes(
         layer._sm70_native_lm_codes.numel() / 2**20,
         layer._sm70_native_lm_gscale)
     return True
+
+
+def _maybe_sm70_native_lm_head_top1(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused NVFP4 GEMM+argmax over the checkpoint's own packed codes.
+
+    Consumes the buffers _load_native_lm_head_codes stashed on the layer.
+    The kernel returns one (value, index) pair per block; a tiny final
+    max+argmax over those pairs yields the global (value, index). Index
+    is LOCAL to this rank's shard — the caller's contract (matching the
+    sm70_f16_lm_head_top1_out call sites) is the global vocab index, so
+    add org_vocab_start_index here.
+    """
+    if not envs.VLLM_SM70_LM_HEAD_NATIVE:
+        return None
+    if not getattr(layer, "_sm70_native_lm_ready", False):
+        return None
+    if x.dim() < 2 or x.shape[-2] != 1:
+        return None
+    if x.dtype != torch.float16 or not x.is_cuda:
+        return None
+    if not hasattr(torch.ops._C, "sm70_nvfp4_simt_argmax_out"):
+        return None
+
+    codes = layer._sm70_native_lm_codes
+    scales = layer._sm70_native_lm_scales
+    gscale = layer._sm70_native_lm_gscale
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    bvals, bidxs = torch.ops._C.sm70_nvfp4_simt_argmax_out(
+        x_2d, codes, scales, float(gscale))
+    mx = bvals.max()
+    blk = (bvals == mx).int().argmax()
+    idx = (bidxs[blk].to(torch.long)
+           + layer.shard_indices.org_vocab_start_index)
+    return mx.view(1), idx.view(1)
 
 
 def __getattr__(name):
