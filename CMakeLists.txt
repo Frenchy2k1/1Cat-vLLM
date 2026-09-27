@@ -800,6 +800,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   target_link_libraries(_sm70_sampler_C PRIVATE
     "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so" CUDA::cuda_driver)
 
+  # Fused NVFP4 GEMM + argmax sidecar (native lm_head top-1). Standalone
+  # wheel module so the native-lm_head route ships without relinking the
+  # primary vllm._C module — same pattern as the sampler fragment above.
+  define_extension_target(
+    _sm70_argmax_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/sm70_nvfp4_simt_argmax.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  set_target_properties(_sm70_argmax_C PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF)
+
   # Native H3 kernels use ordinary Torch/Python ABI and remain independent of
   # the existing primary SM70 extension's registrations.
   define_extension_target(
