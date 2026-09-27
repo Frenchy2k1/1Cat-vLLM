@@ -285,7 +285,9 @@ def _maybe_sm70_native_lm_head_top1(
     blk = (bvals == mx).int().argmax()
     idx = (bidxs[blk].to(torch.long)
            + layer.shard_indices.org_vocab_start_index)
-    return mx.view(1), idx.view(1)
+    # fp16 paths return fp32 values; cast so the sampler consumer sees
+    # the same dtype regardless of which branch produced the result.
+    return mx.float().view(1), idx.view(1)
 
 
 def __getattr__(name):
