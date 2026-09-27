@@ -384,6 +384,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
+    VLLM_SM70_LM_HEAD_NATIVE: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
@@ -5532,6 +5533,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "SM70: enable lm head fastpath. The consumer locations and unset "
             "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_LM_HEAD_NATIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_LM_HEAD_NATIVE", "0"))),
+        description=(
+            "SM70: load the checkpoint's own NVFP4 lm_head codes/scales "
+            "verbatim instead of the fp16 head copy. Falls back cleanly "
+            "when the checkpoint has no native head."
         ),
         category="configuration",
         declared_default="False",

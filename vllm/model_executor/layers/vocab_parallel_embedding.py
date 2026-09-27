@@ -68,7 +68,28 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     if state is None or state.weight is not layer.weight:
         state = _new_sm70_lm_head_state(layer)
         layer._sm70_lm_head_state = state
-    return lm_head_provider.maybe_prepare_sm70_lm_head_top1(state)
+    prepared = lm_head_provider.maybe_prepare_sm70_lm_head_top1(state)
+
+    # Native NVFP4 lm_head: load the checkpoint's own packed codes when
+    # available. Skips tied heads (weight aliased from embed_tokens has
+    # no separate checkpoint tensors) and checkpoints without native
+    # head keys — the fp16 paths above remain the fallback either way.
+    if (
+        prepared
+        and envs.VLLM_SM70_LM_HEAD_NATIVE
+        and not getattr(layer, "_sm70_native_lm_ready", False)
+        and type(layer).__name__ == "ParallelLMHead"
+        and not getattr(layer, "_sm70_tied_weights", False)
+    ):
+        try:
+            from vllm.config import get_current_vllm_config
+
+            model_dir = get_current_vllm_config().model_config.model
+        except Exception:
+            model_dir = None
+        if model_dir and os.path.isdir(model_dir):
+            _load_native_lm_head_codes(layer, model_dir)
+    return prepared
 
 
 def _prepared_sm70_lm_head_state(layer):
