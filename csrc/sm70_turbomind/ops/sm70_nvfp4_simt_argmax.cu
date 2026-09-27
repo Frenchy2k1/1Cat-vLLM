@@ -23,6 +23,7 @@
 
 #include <torch/all.h>
 #include <torch/library.h>
+#include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -289,4 +290,9 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "float gscale) -> Tensor[]");
   ops.impl("sm70_nvfp4_simt_argmax_out", torch::kCUDA,
            &sm70_nvfp4_simt_argmax_out);
+}
+// Standalone-load export: torch's cpp_extension load() requires the
+// module init symbol when building this file outside the wheel build.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &sm70_nvfp4_simt_argmax_out);
 }
