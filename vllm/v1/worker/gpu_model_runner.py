@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Portions adapted from the v100-skinny contributors' fork of 1Cat-vLLM 1.2.2
+# (Apache-2.0): SM70 E5 persistent-metadata speculative round, per-phase GPU
+# profiler and NVTX phase brackets.
 
 import functools
 import gc
@@ -412,6 +416,705 @@ def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
 def _dflash_ddtree_target_forward_profiler_step() -> int:
     # Compatibility name; initialized engines borrow their diagnostic policy.
     return capture_runtime_trace().spec_target_profiler_step
+
+
+# ---- SM70 E5 persistent-metadata speculative round --------------------------
+# Ported from the v100-skinny fork (fork_patches/gpu_model_runner.py, base
+# 1Cat-vLLM 1.2.2), re-derived against this tree's _prepare_inputs /
+# _build_attention_metadata. Keeps the per-round attention + spec-decode
+# metadata objects alive across steady MTP decode rounds instead of
+# rebuilding them, and refreshes only the fields the shadow verifies showed
+# going stale.
+#
+# VLLM_SM70_E5_CACHE=1       serve cached metadata on hit rounds. Default OFF
+#                            in this tree (upstream ran it as the production
+#                            default on GDN-hybrid + MTP, single request,
+#                            async scheduling; flip after an engine-level A/B).
+# VLLM_SM70_E5_VERIFY=1      shadow mode: run the full build every hit round
+#                            and byte-compare it against the cached objects.
+# VLLM_SM70_E5_DRIFT=N       live-drift checkpoints: every Nth hit round does
+#                            the full build under real cached execution and
+#                            byte-compares (names fields that go stale, which
+#                            shadow mode cannot see).
+# VLLM_SM70_E5_REFRESH=N     periodic plain refresh: every Nth hit round runs
+#                            the full build (and recaptures) without the drift
+#                            snapshot cost. The production fallback shape.
+# VLLM_SM70_E5_APPLY=1       refresh stale-able cached fields in place.
+# VLLM_SM70_E5_V2=1          on hit rounds run only _prepare_inputs' per-round
+#                            core and skip its round-invariant scaffolding.
+# VLLM_SM70_E5_FLASH=1       minimum builder refresh: on hit rounds rebuild
+#                            ONLY the flash-attention group pre-submit (its
+#                            small-q decode params are seq-len dependent and
+#                            consumed inside the verify graph); GDN device
+#                            state is covered by _e5_apply_ints.
+# VLLM_SM70_E5_SERVE=FAM     bisection: run the FULL build every hit round but
+#                            serve family FAM ("gdn"/"flash") from the
+#                            originally captured objects.
+# VLLM_SM70_E5_POST=1        v3 lifecycle: full builder every round, but
+#                            AFTER the verify submit (hidden under the drain)
+#                            serve last round's objects and recapture.
+# VLLM_SM70_E5_FLASH_DIFF=1  build the flash metadata twice per hit round
+#                            (pre- and post-accepted-sync) and byte-diff.
+# VLLM_SM70_E5_DIFF=N        metadata-invariance diff probe over N steady
+#                            rounds — the diagnostic that derived the
+#                            byte-identical field set this cache relies on.
+_E5_CACHE = os.getenv("VLLM_SM70_E5_CACHE", "0") == "1"
+_E5_VERIFY = os.getenv("VLLM_SM70_E5_VERIFY", "0") == "1"
+_E5_DRIFT = int(os.getenv("VLLM_SM70_E5_DRIFT", "0") or "0")
+_E5_REFRESH = int(os.getenv("VLLM_SM70_E5_REFRESH", "0") or "0")
+_E5_V2 = os.getenv("VLLM_SM70_E5_V2", "1") == "1"
+_E5_APPLY = os.getenv("VLLM_SM70_E5_APPLY", "1") == "1"
+_E5_SERVE = os.getenv("VLLM_SM70_E5_SERVE", "")
+_E5_POST = os.getenv("VLLM_SM70_E5_POST", "0") == "1"
+_E5_FLASH = os.getenv("VLLM_SM70_E5_FLASH", "1") == "1"
+_E5_FLASH_DIFF = os.getenv("VLLM_SM70_E5_FLASH_DIFF", "0") == "1"
+
+# E5 metadata-invariance diff (diagnostic, VLLM_SM70_E5_DIFF=<rounds>).
+_E5_DIFF_ROUNDS = int(os.getenv("VLLM_SM70_E5_DIFF", "0") or "0")
+_E5_WARMUP_ROUNDS = 60
+_E5_MAX_LEAF_BYTES = 64 * 1024 * 1024
+
+
+def _e5_walk(obj, path, out, seen, depth=0):
+    import dataclasses as _dc
+
+    if obj is None or depth > 8:
+        return
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() * obj.element_size() <= _E5_MAX_LEAF_BYTES:
+            out[path] = obj
+        return
+    if isinstance(obj, np.ndarray):
+        if obj.nbytes <= _E5_MAX_LEAF_BYTES:
+            out[path] = obj
+        return
+    if isinstance(obj, (int, float, bool, str)):
+        out[path] = obj
+        return
+    if id(obj) in seen:
+        return
+    seen.add(id(obj))
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _e5_walk(v, f"{path}.{k}", out, seen, depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _e5_walk(v, f"{path}[{i}]", out, seen, depth + 1)
+    elif _dc.is_dataclass(obj):
+        for f in _dc.fields(obj):
+            _e5_walk(getattr(obj, f.name, None), f"{path}.{f.name}", out,
+                     seen, depth + 1)
+    elif hasattr(obj, "__dict__"):
+        for k, v in vars(obj).items():
+            if not k.startswith("_"):
+                _e5_walk(v, f"{path}.{k}", out, seen, depth + 1)
+
+
+def _e5_snapshot(leaf):
+    if isinstance(leaf, torch.Tensor):
+        return leaf.detach().clone()
+    if isinstance(leaf, np.ndarray):
+        return leaf.copy()
+    return leaf
+
+
+def _e5_equal(a, b):
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
+    if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+        return a.shape == b.shape and a.dtype == b.dtype and np.array_equal(a, b)
+    return type(a) is type(b) and a == b
+
+
+def _e5_delta_note(prev, cur):
+    """For small integer tensors, the elementwise delta IS the update rule."""
+    try:
+        if isinstance(cur, torch.Tensor) and cur.numel() <= 16 \
+                and not cur.dtype.is_floating_point:
+            return f"delta={(cur.cpu() - prev.cpu()).flatten().tolist()}"
+        if isinstance(cur, np.ndarray) and cur.size <= 16 \
+                and cur.dtype.kind in "iu":
+            return (
+                "delta="
+                f"{(cur.astype(np.int64) - prev.astype(np.int64)).flatten().tolist()}"
+            )
+        if isinstance(cur, (int, float)):
+            return f"{prev}->{cur}"
+        if isinstance(cur, torch.Tensor):
+            return f"tensor{tuple(cur.shape)}:{cur.dtype}"
+        if isinstance(cur, np.ndarray):
+            return f"ndarray{cur.shape}:{cur.dtype}"
+    except Exception:
+        pass
+    return "?"
+
+
+def _sm70_e5_diff_probe(self, roots: dict) -> None:
+    rounds_seen = getattr(self, "_e5_round", 0) + 1
+    self._e5_round = rounds_seen
+    if rounds_seen <= _E5_WARMUP_ROUNDS:
+        return
+    leaves: dict = {}
+    for name, obj in roots.items():
+        _e5_walk(obj, name, leaves, set())
+    prev = getattr(self, "_e5_prev", None)
+    stats = getattr(self, "_e5_stats", None)
+    if stats is None:
+        stats = {}
+        self._e5_stats = stats
+    if prev is not None:
+        for path, cur in leaves.items():
+            st = stats.setdefault(path, [0, 0, ""])
+            if path in prev and _e5_equal(prev[path], cur):
+                st[0] += 1
+            else:
+                st[1] += 1
+                if path in prev:
+                    st[2] = _e5_delta_note(prev[path], cur)
+                else:
+                    st[2] = "new-path"
+    self._e5_prev = {path: _e5_snapshot(v) for path, v in leaves.items()}
+    n_diffed = rounds_seen - _E5_WARMUP_ROUNDS - 1
+    if n_diffed == _E5_DIFF_ROUNDS:
+        always_same = [p for p, st in stats.items() if st[1] == 0]
+        changing = [(p, st) for p, st in stats.items() if st[1] > 0]
+        changing.sort(key=lambda x: -x[1][1])
+        logger.info(
+            "[e5-diff] rounds_diffed=%d fields=%d byte_identical=%d "
+            "changing=%d",
+            n_diffed, len(stats), len(always_same), len(changing),
+        )
+        for path, st in changing:
+            logger.info(
+                "[e5-diff] CHANGING %s same=%d diff=%d %s",
+                path, st[0], st[1], st[2],
+            )
+        ident_heads: dict = {}
+        for path in always_same:
+            head = path.split(".")[0]
+            ident_heads[head] = ident_heads.get(head, 0) + 1
+        logger.info("[e5-diff] IDENTICAL by root: %s", ident_heads)
+        self._e5_prev = None
+
+
+def _e5_reject(self, why: str) -> None:
+    st = getattr(self, "_e5_rejects", None)
+    if st is None:
+        st = {}
+        self._e5_rejects = st
+    st[why] = st.get(why, 0) + 1
+    n = sum(st.values())
+    if n <= 3 or n % 200 == 0:
+        logger.info("[e5-cache] rejects=%s", st)
+
+
+def _e5_state_fp(self):
+    """Fingerprint of the GDN/KV state-block geometry for request 0.
+
+    Changes exactly when the builder would emit new state indices or block
+    tables (state-block transition, block append) — those rounds must take
+    the full-rebuild path.
+    """
+    try:
+        req_id = self.input_batch.req_ids[0]
+        state_idx = self.mamba_state_idx.get(req_id)
+        block_lens = tuple(len(b) for b in self.requests[req_id].block_ids)
+        return (req_id, state_idx, block_lens)
+    except Exception:
+        return None
+
+
+def _e5_md_hit(self, scheduler_output) -> bool:
+    """True when this round may reuse the cached attention metadata."""
+    if getattr(self, "_e5_cache_state", None) is None:
+        _e5_reject(self, "no-cache")
+        return False
+    if not self.use_async_scheduling:
+        # The fast path's input ids come from prev_sampled_token_ids on the
+        # GPU (async scheduling). The synchronous path serves the stale
+        # input_ids.cpu staging buffer from _prepare_input_ids and was never
+        # adapted for the cache.
+        _e5_reject(self, "sync-scheduling")
+        return False
+    if self.speculative_config is not None and (
+        self.speculative_config.use_dflash_ddtree()
+    ):
+        # DDTree rounds carry per-round parent metadata and position
+        # overrides that the persistent path does not model.
+        _e5_reject(self, "ddtree")
+        return False
+    if self.parallel_config.num_ubatches > 1:
+        # Capture/serving only covers the single-ubatch metadata dict layout.
+        _e5_reject(self, "ubatch")
+        return False
+    so = scheduler_output
+    k1 = self.num_spec_tokens + 1
+    if so.total_num_scheduled_tokens != k1 or self.input_batch.num_reqs != 1:
+        _e5_reject(self, "shape")
+        return False
+    if getattr(so, "scheduled_new_reqs", None) or \
+            getattr(so, "finished_req_ids", None):
+        _e5_reject(self, "batch-change")
+        return False
+    if getattr(so, "grammar_bitmask", None) is not None:
+        _e5_reject(self, "grammar")
+        return False
+    spec = so.scheduled_spec_decode_tokens
+    if len(spec) != 1 or len(next(iter(spec.values()))) != self.num_spec_tokens:
+        _e5_reject(self, "spec-shape")
+        return False
+    if _e5_state_fp(self) != self._e5_cache_state.get("state_fp"):
+        _e5_reject(self, "state-transition")
+        return False
+    # First decode round after prefill: the drafter catches up over the
+    # whole prompt (set_inputs_first_pass, num_tokens = prompt length) and
+    # needs freshly built indices/metadata — never serve it from cache.
+    if int(self.input_batch.num_computed_tokens_cpu[0]) <= int(
+        self.input_batch.num_prompt_tokens[0]
+    ):
+        _e5_reject(self, "drafter-catchup")
+        return False
+    self._e5_hit_n = getattr(self, "_e5_hit_n", 0) + 1
+    if _E5_REFRESH and self._e5_hit_n % _E5_REFRESH == 0:
+        _e5_reject(self, "refresh")
+        return False
+    return True
+
+
+def _e5_cache_capture(self, scheduler_output, attn_metadata, spec_common,
+                      logits_indices=None, spec_decode_metadata=None):
+    if not isinstance(attn_metadata, dict) or spec_common is None:
+        return
+    if self.input_batch.num_reqs != 1 \
+            or scheduler_output.total_num_scheduled_tokens != (
+                self.num_spec_tokens + 1):
+        return
+    # Never capture the first rounds after a request/state change: the
+    # first decode round is the drafter's prompt catch-up and carries
+    # special-shaped indices/metadata (async-optimistic counters make it
+    # undetectable via num_computed).
+    fp = _e5_state_fp(self)
+    if fp != getattr(self, "_e5_last_fp", object()):
+        self._e5_last_fp = fp
+        self._e5_fp_rounds = 0
+    self._e5_fp_rounds = getattr(self, "_e5_fp_rounds", 0) + 1
+    if self._e5_fp_rounds < 3:
+        return
+    groups = list({id(v): v for v in attn_metadata.values()}.values())
+    if not getattr(self, "_e5_cap_logged", False):
+        self._e5_cap_logged = True
+        logger.info("[e5-cache] captured: groups=%d", len(groups))
+    gid_of = {}
+    for gid, grp in enumerate(self.kv_cache_config.kv_cache_groups):
+        for ln in grp.layer_names:
+            md = attn_metadata.get(ln)
+            if md is not None:
+                gid_of[id(md)] = gid
+    gids = [gid_of.get(id(g)) for g in groups]
+    state = {
+        "attn_md": attn_metadata,
+        "spec_common": spec_common,
+        "groups": groups,
+        "gids": gids,
+        "flash_gids": {
+            gid for obj, gid in zip(groups, gids)
+            if gid is not None
+            and not hasattr(obj, "spec_state_indices_tensor")
+        },
+        "state_fp": _e5_state_fp(self),
+    }
+    if logits_indices is not None and spec_decode_metadata is not None:
+        state["logits_indices"] = logits_indices
+        state["spec_md"] = spec_decode_metadata
+        state["cu8"] = np.array([self.num_spec_tokens + 1], dtype=np.int32)
+        # Constant composite gather index: the full path derives draft ids
+        # as input_ids.gpu[logits_indices][target_logits_indices + 1].
+        state["draft_src_idx"] = logits_indices[
+            spec_decode_metadata.target_logits_indices + 1
+        ].clone()
+    self._e5_cache_state = state
+
+
+def _e5_fast_prepare_v2(self, scheduler_output):
+    """Persistent-metadata prepare for steady decode-(k+1) hit rounds.
+
+    Executes only _prepare_inputs' per-round core — the SAME device ops and
+    syncs as the full path — and skips the scaffolding that rebuilds and
+    re-uploads round-invariant constants (req_indices, query_pos,
+    cu_num_tokens, query_start_loc, num_scheduled_tokens,
+    num_decode_draft_tokens tails, spec-metadata skeleton, logits_indices).
+    Nothing is computed incrementally: every skipped buffer was last written
+    by a same-shape full round (capture/refresh/verify), which is exactly
+    the value the full path would recompute here.
+    """
+    cache = self._e5_cache_state
+    so = scheduler_output
+    num_reqs = 1
+    total = self.num_spec_tokens + 1
+    self._ddtree_parent_metadata = None
+
+    base = int(self.input_batch.num_computed_tokens_cpu[0])
+    pos_np = base + np.arange(total, dtype=np.int64)
+    self._current_positions_cpu_sidecar = pos_np
+    req_idx_np = np.zeros(total, dtype=np.int64)
+    self._current_req_indices_cpu_sidecar = req_idx_np
+
+    # Block table H2D (content changes only when a block is appended).
+    self._commit_block_table_to_gpu(num_reqs)
+
+    # Rope host-side position tables move with base.
+    if self.uses_mrope:
+        self._calc_mrope_positions(so)
+    if self.uses_xdrope_dim > 0:
+        self._calc_xdrope_positions(so)
+
+    # Optimistic seq lens + discard mask (single decode request).
+    self.optimistic_seq_lens_cpu[0] = base + total
+    self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+    num_tokens_now = self.requests[self.input_batch.req_ids[0]].num_tokens
+    self.discard_request_mask.np[0] = (base + total) < num_tokens_now
+    self._copy_buffer_to_gpu(self.discard_request_mask, num_reqs)
+
+    # NOTE: hoisting the flash-group build before this sync was measured
+    # upstream (v6) and REVERTED — it reads accepted-count-dependent state
+    # and the long-form texts diverge. It must run post-sync, pre-submit
+    # (v5).
+    self._e5_flash_result = None
+    self._e5_fdiff_snap = None
+    if _E5_FLASH_DIFF and getattr(self, "_e5_bargs", None) is not None \
+            and cache.get("flash_gids"):
+        _pre_md, _pre_common = self._build_attention_metadata(
+            **self._e5_bargs, only_gids=cache["flash_gids"])
+        leaves: dict = {}
+        _e5_walk({"md": _pre_md, "common": _pre_common}, "f", leaves, set())
+        self._e5_fdiff_snap = {k: _e5_snapshot(v) for k, v in leaves.items()}
+
+    # Accepted-count sync — verbatim from _prepare_inputs' event branch.
+    self._compute_prev_positions(num_reqs)
+    prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+    if self.num_accepted_tokens_event is not None:
+        self._event_tracer.synchronize(
+            self.num_accepted_tokens_event,
+            "GPUModelRunner.num_accepted_tokens_event.synchronize",
+        )
+        self._sync_mamba_accepted_token_state(so, num_reqs)
+        self.num_accepted_tokens.np[num_reqs:].fill(1)
+        self.spec_state_slot_selectors.np[num_reqs:].fill(1)
+        self._copy_buffer_to_gpu(self.num_accepted_tokens)
+        self._copy_buffer_to_gpu(self.spec_state_slot_selectors)
+    else:
+        self.num_accepted_tokens.np.fill(1)
+        self.num_accepted_tokens.gpu.fill_(1)
+        self.spec_state_slot_selectors.np.fill(1)
+        self.spec_state_slot_selectors.gpu.fill_(1)
+
+    # Mamba spec-decode state sync — verbatim.
+    if self.mamba_prev_last_scheduled_idx is not None:
+        mamba_utils.preprocess_mamba_all_specdec(
+            so,
+            self.input_batch,
+            self.mamba_state_idx,
+            num_reqs,
+            self.mamba_prev_last_scheduled_idx,
+        )
+
+    # num_computed on GPU — verbatim async branch.
+    participating_prev_positions = (
+        _async_spec_decode_participating_prev_positions(
+            self.prev_positions.np[:num_reqs],
+            self.prev_num_draft_tokens.np,
+        )
+        if self.use_async_spec_decode and prev_req_id_to_index
+        else np.empty(0, dtype=np.int32)
+    )
+    if (
+        self.use_async_spec_decode
+        and self.valid_sampled_token_count_gpu is not None
+        and prev_req_id_to_index
+        and participating_prev_positions.size > 0
+    ):
+        max_prev_position = int(participating_prev_positions.max())
+        if max_prev_position >= self.valid_sampled_token_count_gpu.shape[0]:
+            raise RuntimeError(
+                "Async speculative decode draft-count state is inconsistent: "
+                f"required previous row {max_prev_position}, but valid sampled "
+                "token counts contain only "
+                f"{self.valid_sampled_token_count_gpu.shape[0]} rows."
+            )
+        self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
+        self._copy_buffer_to_gpu(self.prev_num_draft_tokens)
+        cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+            device=self.device, non_blocking=True
+        )
+        update_num_computed_tokens_for_batch_change(
+            self.num_computed_tokens,
+            self.num_accepted_tokens.gpu[:num_reqs],
+            self.prev_positions.gpu[:num_reqs],
+            self.valid_sampled_token_count_gpu,
+            self.prev_num_draft_tokens.gpu,
+            cpu_values,
+        )
+    else:
+        self.num_computed_tokens[:num_reqs].copy_(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+
+    # Positions / seq_lens — the full path's own device ops. req_indices,
+    # query_pos, num_scheduled_tokens and query_start_loc are constant under
+    # the hit gate and already resident on GPU from the capture round.
+    req_indices_gpu = self.req_indices.gpu[:total]
+    self.positions[:total] = (
+        self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+        + self.query_pos.gpu[:total]
+    )
+    self.seq_lens[:num_reqs] = (
+        self.num_computed_tokens[:num_reqs]
+        + self.num_scheduled_tokens.gpu[:num_reqs]
+    )
+    self.seq_lens[num_reqs:].fill_(0)
+
+    # Slot mapping — verbatim per-group loop.
+    for group_id, kv_cache_group in enumerate(
+        self.kv_cache_config.kv_cache_groups
+    ):
+        kv_cache_spec = kv_cache_group.kv_cache_spec
+        is_circular = isinstance(kv_cache_spec, CircularBufferSpec)
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            is_circular = all(
+                isinstance(spec, CircularBufferSpec)
+                for spec in kv_cache_spec.kv_cache_specs.values()
+            )
+        block_table = self.input_batch.block_table[group_id]
+        if is_circular:
+            # QSA derives ring slots from logical positions in its own
+            # metadata builder. Generic mapping would index beyond the
+            # ring's single block-table column.
+            block_table.slot_mapping.gpu.fill_(PAD_SLOT_ID)
+            continue
+        block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            self.positions[:total],
+        )
+
+    self._apply_ddtree_position_overrides(so, num_reqs, cache["cu8"],
+                                          cache["cu8"])
+
+    # Input token ids — verbatim (async prev-sampled handling lives inside).
+    self._prepare_input_ids(so, num_reqs, total, cache["cu8"])
+
+    # Rope device buffers + async drift correction — verbatim.
+    if self.uses_mrope:
+        self._copy_position_buffer_to_gpu(self.mrope_positions, total)
+    elif self.uses_xdrope_dim > 0:
+        self._copy_position_buffer_to_gpu(self.xdrope_positions, total)
+    if self.use_async_spec_decode and (
+        self.uses_mrope or self.uses_xdrope_dim > 0
+    ):
+        drift = self.num_computed_tokens[req_indices_gpu].to(
+            torch.int64
+        ) - self.input_batch.num_computed_tokens_cpu_tensor[req_idx_np].to(
+            device=self.device, dtype=torch.int64, non_blocking=True
+        )
+        target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
+        target.gpu[:, :total] += drift
+
+    # Spec metadata: cached skeleton + this round's draft ids, derived
+    # exactly as the full path does — from input_ids.gpu (which
+    # _prepare_input_ids just filled with the async-substituted real
+    # tokens), NOT from the CPU scheduler lists (stale in async mode).
+    spec_md = cache["spec_md"]
+    spec_md.draft_token_ids.copy_(
+        self.input_ids.gpu[cache["draft_src_idx"]], non_blocking=True
+    )
+    if not getattr(self, "_e5v2_logged", False):
+        self._e5v2_logged = True
+        logger.info("[e5-v2] persistent prepare active")
+    return cache["logits_indices"], spec_md
+
+
+def _e5_prep_roots(self) -> dict:
+    cache = self._e5_cache_state
+    roots = {
+        "input_ids8": self.input_ids.gpu[:8],
+        "pos1d": self.positions[:8],
+        "seq_lens2": self.seq_lens[:2],
+        "opt2": self.optimistic_seq_lens_cpu[:2],
+        "discard": self.discard_request_mask.np[:1].copy(),
+        "num_computed1": self.num_computed_tokens[:1],
+        "accepted1": self.num_accepted_tokens.gpu[:1],
+        "selectors1": self.spec_state_slot_selectors.gpu[:1],
+        "sidecar_pos": self._current_positions_cpu_sidecar,
+        "spec_md": cache["spec_md"],
+        "logits_idx": cache["logits_indices"],
+    }
+    try:
+        for gid in range(len(self.kv_cache_config.kv_cache_groups)):
+            roots[f"slot{gid}"] = (
+                self.input_batch.block_table[gid].slot_mapping.gpu[:8]
+            )
+    except Exception:
+        pass
+    if self.uses_xdrope_dim > 0:
+        roots["xdrope"] = self.xdrope_positions.gpu[:, :8]
+    return roots
+
+
+def _e5_prep_verify(self, scheduler_output, num_scheduled_tokens_np):
+    """Verify mode: run v2, snapshot its products, re-run the full prepare,
+    byte-compare. Returns the full path's outputs (shadow)."""
+    _e5_fast_prepare_v2(self, scheduler_output)
+    leaves: dict = {}
+    for name, obj in _e5_prep_roots(self).items():
+        _e5_walk(obj, name, leaves, set())
+    snap = {k: _e5_snapshot(v) for k, v in leaves.items()}
+    logits_indices, spec_md = self._prepare_inputs(
+        scheduler_output, num_scheduled_tokens_np
+    )
+    leaves2: dict = {}
+    for name, obj in _e5_prep_roots(self).items():
+        _e5_walk(obj, name, leaves2, set())
+    leaves2["ret_logits_idx"] = logits_indices
+    snap["ret_logits_idx"] = snap.get("logits_idx")
+    bad = []
+    for path, cur in leaves2.items():
+        if path not in snap:
+            bad.append((path, "missing"))
+        elif not _e5_equal(snap[path], cur):
+            bad.append((path, _e5_delta_note(snap[path], cur)))
+    n = getattr(self, "_e5v2_n", 0) + 1
+    self._e5v2_n = n
+    if bad or n % 100 == 0:
+        logger.info(
+            "[e5v2-verify] round=%d fields=%d mismatch=%d",
+            n, len(leaves2), len(bad),
+        )
+    seen = getattr(self, "_e5v2_bad", None)
+    if seen is None:
+        seen = set()
+        self._e5v2_bad = seen
+    for path, note in bad:
+        if path not in seen:
+            seen.add(path)
+            logger.info("[e5v2-verify] MISMATCH %s %s", path, note)
+    return logits_indices, spec_md
+
+
+def _e5_serve_family(self, fresh_md):
+    """Swap in the captured objects for one builder family only."""
+    cache = self._e5_cache_state
+    cached_by_gid = {
+        gid: obj for obj, gid in zip(cache["groups"], cache["gids"])
+        if gid is not None
+    }
+    swapped = 0
+    for gid, grp in enumerate(self.kv_cache_config.kv_cache_groups):
+        obj = cached_by_gid.get(gid)
+        if obj is None:
+            continue
+        is_gdn = hasattr(obj, "spec_state_indices_tensor")
+        if (_E5_SERVE == "gdn") == is_gdn:
+            for ln in grp.layer_names:
+                if ln in fresh_md:
+                    fresh_md[ln] = obj
+            swapped += 1
+    if not getattr(self, "_e5_serve_logged", False):
+        self._e5_serve_logged = True
+        logger.info(
+            "[e5-serve] family=%s groups_swapped=%d", _E5_SERVE, swapped
+        )
+    return fresh_md
+
+
+def _e5_apply_ints(self) -> None:
+    """Refresh what the 446-round shadow verify showed going stale: the
+    moving host ints, the two accepted-count buffers (from the runner
+    buffers _prepare_inputs maintains), and the GDN state-slot indices
+    (replicating the builder's _get_current_mamba_state_block_ids for
+    batch=1 — mamba_state_idx and block_ids are current because
+    update_states and preprocess_mamba still run)."""
+    cache = self._e5_cache_state
+    opt = int(self.optimistic_seq_lens_cpu[0])
+    for obj in [cache["spec_common"], *cache["groups"]]:
+        if isinstance(getattr(obj, "max_seq_len", None), int):
+            try:
+                object.__setattr__(obj, "max_seq_len", opt)
+            except Exception:
+                pass
+    acc = self.num_accepted_tokens.gpu
+    sel = self.spec_state_slot_selectors.gpu
+    req_id = self.input_batch.req_ids[0]
+    state_idx = self.mamba_state_idx.get(req_id)
+    req_state = self.requests[req_id]
+    for obj, gid in zip(cache["groups"], cache["gids"]):
+        t = getattr(obj, "num_accepted_tokens", None)
+        if isinstance(t, torch.Tensor):
+            n = min(t.shape[0], acc.shape[0])
+            t[:n].copy_(acc[:n], non_blocking=True)
+        t = getattr(obj, "spec_state_slot_selectors", None)
+        if isinstance(t, torch.Tensor):
+            n = min(t.shape[0], sel.shape[0])
+            t[:n].copy_(sel[:n], non_blocking=True)
+        t = getattr(obj, "spec_state_indices_tensor", None)
+        if isinstance(t, torch.Tensor) and state_idx is not None \
+                and gid is not None:
+            block_ids = req_state.block_ids[gid]
+            width = t.shape[-1]
+            row = [
+                block_ids[state_idx + off]
+                if 0 <= state_idx + off < len(block_ids) else -1
+                for off in range(width)
+            ]
+            t[0].copy_(torch.tensor(row, dtype=t.dtype))
+
+
+def _e5_md_roots(attn_md, spec_common):
+    groups = list({id(v): v for v in attn_md.values()}.values()) \
+        if isinstance(attn_md, dict) else [attn_md]
+    return {"spec_common": spec_common,
+            "am": {f"g{i}": g for i, g in enumerate(groups)}}
+
+
+def _e5_shadow_snapshot(self) -> None:
+    _e5_apply_ints(self)
+    cache = self._e5_cache_state
+    leaves: dict = {}
+    for name, obj in _e5_md_roots(cache["attn_md"],
+                                  cache["spec_common"]).items():
+        _e5_walk(obj, name, leaves, set())
+    self._e5_shadow = {k: _e5_snapshot(v) for k, v in leaves.items()}
+
+
+def _e5_shadow_compare(self, attn_md, spec_common) -> None:
+    snap = getattr(self, "_e5_shadow", None)
+    if snap is None:
+        return
+    self._e5_shadow = None
+    leaves: dict = {}
+    for name, obj in _e5_md_roots(attn_md, spec_common).items():
+        _e5_walk(obj, name, leaves, set())
+    bad = []
+    for path, cur in leaves.items():
+        if path not in snap:
+            bad.append((path, "missing"))
+        elif not _e5_equal(snap[path], cur):
+            bad.append((path, _e5_delta_note(snap[path], cur)))
+    n = getattr(self, "_e5_verify_n", 0) + 1
+    self._e5_verify_n = n
+    seen = getattr(self, "_e5_bad_paths", None)
+    if seen is None:
+        seen = set()
+        self._e5_bad_paths = seen
+    if n % 100 == 0 or bad:
+        logger.info(
+            "[e5-verify] round=%d fields=%d mismatch=%d",
+            n, len(leaves), len(bad),
+        )
+    for path, note in bad:
+        if path not in seen:
+            seen.add(path)
+            logger.info("[e5-verify] MISMATCH %s %s", path, note)
 
 
 def _maybe_dump_sm70_mtp_step(
@@ -5133,9 +5836,14 @@ class GPUModelRunner(
         cudagraph_capture_max_seq_len: int | None = None,
         cudagraph_graph_variant: int | None = None,
         is_dummy_batch: bool = False,
+        only_gids: set[int] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+
+        ``only_gids`` restricts the build to the given kv-cache group ids
+        (E5 flash-group refresh); skipped groups simply have no entries in
+        the returned per-layer dict.
         """
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
@@ -5482,6 +6190,8 @@ class GPUModelRunner(
         dflash_common_attn_metadata_by_gid: dict[int, CommonAttentionMetadata] | None
         dflash_common_attn_metadata_by_gid = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+            if only_gids is not None and kv_cache_gid not in only_gids:
+                continue
             cm = copy(cm_base)  # shallow copy
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -8369,10 +9079,22 @@ class GPUModelRunner(
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            _e5_hit = _E5_CACHE and _e5_md_hit(self, scheduler_output)
+            _e5_v2 = (_E5_V2 and _e5_hit
+                      and "spec_md" in self._e5_cache_state)
+            if _e5_v2 and not _E5_VERIFY:
+                logits_indices, spec_decode_metadata = _e5_fast_prepare_v2(
+                    self, scheduler_output
+                )
+            elif _e5_v2:
+                logits_indices, spec_decode_metadata = _e5_prep_verify(
+                    self, scheduler_output, num_scheduled_tokens_np
+                )
+            else:
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0
@@ -8508,22 +9230,141 @@ class GPUModelRunner(
                 ) * 1000.0
 
             trace_attn_metadata_t0 = time.perf_counter() if trace_log else 0.0
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
-                    ddtree_parent_metadata=self._ddtree_parent_metadata,
-                )
+            _e5_drift_ck = (
+                _E5_DRIFT and _e5_hit and self._e5_hit_n % _E5_DRIFT == 0
             )
+            if _e5_hit and _e5_state_fp(self) != (
+                self._e5_cache_state.get("state_fp")
+            ):
+                # preprocess_mamba moved the state block after the early
+                # hit decision — this round must build fresh metadata.
+                _e5_reject(self, "late-state-transition")
+                _e5_hit = False
+                _e5_v2 = False
+            if _e5_hit and not _E5_VERIFY and not _e5_drift_ck \
+                    and not _E5_SERVE:
+                if _E5_APPLY:
+                    _e5_apply_ints(self)
+                attn_metadata = self._e5_cache_state["attn_md"]
+                spec_decode_common_attn_metadata = (
+                    self._e5_cache_state["spec_common"]
+                )
+                if _E5_FLASH:
+                    _fl = getattr(self, "_e5_flash_result", None)
+                    if _fl is None and self._e5_cache_state.get(
+                            "flash_gids"):
+                        _fl = self._build_attention_metadata(
+                            **self._e5_bargs,
+                            only_gids=self._e5_cache_state["flash_gids"])
+                    if _fl is not None and getattr(
+                            self, "_e5_fdiff_snap", None) is not None:
+                        snap = self._e5_fdiff_snap
+                        self._e5_fdiff_snap = None
+                        leaves2: dict = {}
+                        _e5_walk({"md": _fl[0], "common": _fl[1]},
+                                 "f", leaves2, set())
+                        bad = [
+                            (pth, _e5_delta_note(snap[pth], cur))
+                            for pth, cur in leaves2.items()
+                            if pth in snap and not _e5_equal(snap[pth], cur)
+                        ]
+                        n = getattr(self, "_e5_fdiff_n", 0) + 1
+                        self._e5_fdiff_n = n
+                        seen = getattr(self, "_e5_fdiff_seen", None)
+                        if seen is None:
+                            seen = set()
+                            self._e5_fdiff_seen = seen
+                        if n % 100 == 0:
+                            logger.info(
+                                "[e5-fdiff] round=%d fields=%d mismatch=%d",
+                                n, len(leaves2), len(bad),
+                            )
+                        for pth, note in bad:
+                            if pth not in seen:
+                                seen.add(pth)
+                                logger.info("[e5-fdiff] DEP %s %s", pth, note)
+                    if _fl is not None:
+                        _fl_md, _fl_common = _fl
+                        self._e5_flash_result = None
+                        attn_metadata = dict(attn_metadata)
+                        attn_metadata.update(_fl_md)
+                        # NEVER override spec_common from the restricted
+                        # build: it returns a flash-geometry cm, while the
+                        # full path's spec_common is GDN-based — the
+                        # mismatch flips a bistable near-tie token
+                        # (observed twice at the same char offset).
+                if _E5_POST:
+                    self._e5_post_args = dict(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=(num_tokens_padded
+                                           if pad_attn else None),
+                        num_reqs=num_reqs,
+                        num_reqs_padded=(num_reqs_padded
+                                         if pad_attn else None),
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=(
+                            scheduler_output.num_scheduled_tokens),
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                        ddtree_parent_metadata=self._ddtree_parent_metadata,
+                    )
+                    self._e5_post_sched = scheduler_output
+            else:
+                if _e5_hit:
+                    if _e5_drift_ck:
+                        logger.info(
+                            "[e5-drift] checkpoint at hit %d", self._e5_hit_n
+                        )
+                    _e5_shadow_snapshot(self)
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                        ddtree_parent_metadata=self._ddtree_parent_metadata,
+                    )
+                )
+                if _e5_hit and _E5_SERVE and not _E5_VERIFY \
+                        and "gids" in self._e5_cache_state:
+                    attn_metadata = _e5_serve_family(self, attn_metadata)
+                if _e5_hit:
+                    _e5_shadow_compare(
+                        self, attn_metadata,
+                        spec_decode_common_attn_metadata)
+                if _E5_CACHE and not (_E5_SERVE and _e5_hit):
+                    self._e5_bargs = dict(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=(num_tokens_padded
+                                           if pad_attn else None),
+                        num_reqs=num_reqs,
+                        num_reqs_padded=(num_reqs_padded
+                                         if pad_attn else None),
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=(
+                            scheduler_output.num_scheduled_tokens),
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                        ddtree_parent_metadata=self._ddtree_parent_metadata,
+                    )
+                    _e5_cache_capture(
+                        self, scheduler_output, attn_metadata,
+                        spec_decode_common_attn_metadata,
+                        logits_indices=logits_indices,
+                        spec_decode_metadata=spec_decode_metadata)
             if trace_log:
                 trace_attn_metadata_ms = (
                     time.perf_counter() - trace_attn_metadata_t0
@@ -8567,6 +9408,32 @@ class GPUModelRunner(
                 input_batch=self.input_batch,
                 diagnostics=self._diagnostics,
             )
+
+            if _E5_DIFF_ROUNDS and num_tokens_unpadded == (
+                self.num_spec_tokens + 1
+            ):
+                _sm70_e5_diff_probe(self, {
+                    "input_ids": input_ids,
+                    "positions": positions,
+                    "logits_indices": logits_indices,
+                    "qsl": self.query_start_loc,
+                    "seq_lens": self.seq_lens,
+                    "slot_maps": slot_mappings_by_group,
+                    "spec_md": spec_decode_metadata,
+                    "spec_common": spec_decode_common_attn_metadata,
+                    "batch_desc": batch_desc,
+                    "scalars": {
+                        "num_reqs": num_reqs,
+                        "num_reqs_padded": num_reqs_padded,
+                        "num_tokens_padded": num_tokens_padded,
+                        "cg_mode": str(cudagraph_mode),
+                    },
+                    "am": {
+                        f"g{i}": g for i, g in enumerate(
+                            {id(v): v for v in attn_metadata.values()}.values()
+                        )
+                    } if isinstance(attn_metadata, dict) else attn_metadata,
+                })
 
         if trace_log:
             trace_preprocess_ms = (time.perf_counter() - trace_preprocess_t0) * 1000.0
@@ -8650,6 +9517,16 @@ class GPUModelRunner(
             )
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
+        _e5_post_args = getattr(self, "_e5_post_args", None)
+        if _e5_post_args is not None:
+            self._e5_post_args = None
+            _post_md, _post_common = self._build_attention_metadata(
+                **_e5_post_args)
+            _e5_cache_capture(
+                self, self._e5_post_sched, _post_md, _post_common,
+                logits_indices=_e5_post_args["logits_indices"],
+                spec_decode_metadata=spec_decode_metadata)
+            self._e5_post_sched = None
         if trace_log:
             trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
         self._step_profiler.finish(
