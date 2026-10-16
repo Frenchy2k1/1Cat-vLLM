@@ -387,6 +387,27 @@ if TYPE_CHECKING:
     VLLM_SM70_LM_HEAD_NATIVE: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
+    VLLM_SM70_E5_CACHE: bool = False
+    VLLM_SM70_E5_VERIFY: bool = False
+    VLLM_SM70_E5_DRIFT: int = 0
+    VLLM_SM70_E5_REFRESH: int = 0
+    VLLM_SM70_E5_V2: bool = True
+    VLLM_SM70_E5_APPLY: bool = True
+    VLLM_SM70_E5_SERVE: str = ""
+    VLLM_SM70_E5_POST: bool = False
+    VLLM_SM70_E5_FLASH: bool = True
+    VLLM_SM70_E5_FLASH_DIFF: bool = False
+    VLLM_SM70_E5_DIFF: int = 0
+    VLLM_SM70_E5_PROF: int = 0
+    VLLM_SM70_E5_NVTX: bool = False
+    VLLM_SM70_E5_SUBPROF: bool = False
+    VLLM_SKINNY_NVFP4: bool = False
+    VLLM_SKINNY_NVFP4_SRC: str = ""
+    VLLM_SKINNY_MAX_M: int = 64
+    VLLM_SKINNY_QPN: bool = True
+    VLLM_SKINNY_QPN2: bool = True
+    VLLM_SKINNY_DROP_CT: bool = False
+    VLLM_SKINNY_ROUTE_COUNT_FILE: str = ""
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
     VLLM_SM70_DFLASH2_FP32_LOGITS: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
@@ -5539,6 +5560,283 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_CACHE": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_CACHE", "0") == "1",
+        description=(
+            "SM70: serve cached attention/spec metadata on steady MTP "
+            "decode rounds (single-request, spec-shape stable). Round 1 "
+            "and any batch/state change fall back to full prepare."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 E5 persistent-metadata spec round",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_VERIFY": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_VERIFY", "0") == "1",
+        description=(
+            "SM70 E5 shadow mode: run the full metadata build on every hit "
+            "round alongside the cached leg for drift comparison."
+        ),
+        category="debugging",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_DRIFT": env_var(
+        lambda: int(os.getenv("VLLM_SM70_E5_DRIFT", "0") or "0"),
+        description=(
+            "SM70 E5 live-drift checkpoints: every Nth hit round re-checks "
+            "cached metadata against a fresh build. 0 disables."
+        ),
+        category="debugging",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_REFRESH": env_var(
+        lambda: int(os.getenv("VLLM_SM70_E5_REFRESH", "0") or "0"),
+        description=(
+            "SM70 E5 periodic plain refresh: every Nth hit round runs the "
+            "full prepare. 0 disables."
+        ),
+        category="debugging",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_V2": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_V2", "1") == "1",
+        description=(
+            "SM70 E5: on hit rounds run only _prepare_inputs' per-round "
+            "delta instead of the full prepare."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 E5 persistent-metadata spec round",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_APPLY": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_APPLY", "1") == "1",
+        description=(
+            "SM70 E5: refresh stale-able cached metadata fields in place on "
+            "hit rounds."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 E5 persistent-metadata spec round",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_SERVE": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_SERVE", ""),
+        description=(
+            "SM70 E5 bisection knob: run the full build every hit round but "
+            "serve metadata for the named family."
+        ),
+        category="debugging",
+        declared_default="",
+        effective_default="",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_POST": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_POST", "0") == "1",
+        description=(
+            "SM70 E5 v3 lifecycle: full builder every round, cached serve "
+            "after the refresh point."
+        ),
+        category="debugging",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_FLASH": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_FLASH", "1") == "1",
+        description=(
+            "SM70 E5 minimum builder refresh: on hit rounds rebuild only "
+            "the flash metadata."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 E5 persistent-metadata spec round",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_FLASH_DIFF": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_FLASH_DIFF", "0") == "1",
+        description=(
+            "SM70 E5 probe: build the flash metadata twice per hit round "
+            "and compare."
+        ),
+        category="debugging",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_DIFF": env_var(
+        lambda: int(os.getenv("VLLM_SM70_E5_DIFF", "0") or "0"),
+        description=(
+            "SM70 E5 metadata-invariance diff probe over N steady rounds. "
+            "0 disables."
+        ),
+        category="debugging",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_PROF": env_var(
+        lambda: int(os.getenv("VLLM_SM70_E5_PROF", "0") or "0"),
+        description=(
+            "SM70 E5 per-phase GPU profiler: time N steady spec rounds and "
+            "report per-phase segments. 0 disables."
+        ),
+        category="debugging",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_NVTX": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_NVTX", "0") == "1",
+        description=(
+            "SM70 E5: emit NVTX phase brackets (prepare/verify/draft) for "
+            "nsys attribution."
+        ),
+        category="debugging",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_E5_SUBPROF": env_var(
+        lambda: os.getenv("VLLM_SM70_E5_SUBPROF", "0") == "1",
+        description=(
+            "SM70 E5 profiler: subdivide phases into sub-segments."
+        ),
+        category="debugging",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_NVFP4": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_NVFP4", "0") == "1",
+        description=(
+            "SM70: route small-M NVFP4 GEMMs through the skinny kernel "
+            "family (QPN2/QPN/SIMT/WMMA) in the FP4-Marlin linear. Note: "
+            "on SM70 the TurboMind dense path prepares NVFP4 layers ahead "
+            "of the Marlin kernel and bypasses this route entirely."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_NVFP4_SRC": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_NVFP4_SRC", ""),
+        description=(
+            "SM70 skinny: override path to skinny_kernels.cu for the JIT "
+            "load (default: the copy shipped under "
+            "vllm/model_executor/kernels/linear/kernels/)."
+        ),
+        category="configuration",
+        declared_default="",
+        effective_default="shipped skinny_kernels.cu path",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_MAX_M": env_var(
+        lambda: int(os.environ.get("VLLM_SKINNY_MAX_M", "64")),
+        description=(
+            "SM70 skinny: upper M bound for the skinny WMMA path; above "
+            "it the Marlin kernel serves the GEMM."
+        ),
+        category="tuning",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_QPN": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_QPN", "1") == "1",
+        description=(
+            "SM70 skinny: prepack QPN weight codes (Volta-native m8n8k4 "
+            "path for M 4..16)."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_QPN2": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_QPN2", "1") == "1",
+        description=(
+            "SM70 skinny: QPN2 kernel owns M 1..8 (shape-gated per-shard "
+            "config table)."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_DROP_CT": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_DROP_CT", "0") == "1",
+        description=(
+            "SM70 skinny: drop the checkpoint-native codes/scales stash "
+            "(SIMT/WMMA source) to reclaim VRAM when only QPN bands are "
+            "used."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 skinny NVFP4 GEMM",),
+        user_visible=False,
+    ),
+    "VLLM_SKINNY_ROUTE_COUNT_FILE": env_var(
+        lambda: os.environ.get("VLLM_SKINNY_ROUTE_COUNT_FILE", ""),
+        description=(
+            "SM70 skinny: flush per-(route, M) dispatch counters to "
+            "<file>.<pid> (engagement proof for benchmarks)."
+        ),
+        category="debugging",
+        declared_default="",
+        effective_default="",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=False,
     ),
     "VLLM_SM70_LM_HEAD_NATIVE": env_var(
