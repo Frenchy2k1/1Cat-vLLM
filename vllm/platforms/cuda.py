@@ -744,8 +744,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
             # pynvml.NVMLError is not a RuntimeError; on DGXS-style boxes the
             # NVML index space is sparse (a single GPU at PCI index 1 leaves
             # handle 0 raising NVMLError_Unknown), so any NVML failure must
-            # degrade to "unknown capability", never raise past here.
-            return None
+            # degrade gracefully, never raise past here. Returning None is
+            # NOT enough: downstream consumers treat None as "unknown device"
+            # (bf16 support checks fail, device names render as
+            # <unavailable:N>), so fall back to the torch query — it may
+            # initialize CUDA, which is acceptable when NVML cannot answer.
+            return cls._torch_device_capability(device_id)
 
     @classmethod
     @with_nvml_context
