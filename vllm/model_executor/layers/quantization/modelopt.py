@@ -432,6 +432,18 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # Admit pre-Ampere (Volta/Turing) when a proven software FP8 backend is
+        # selected, mirroring ModelOptMixedPrecisionConfig.get_min_capability
+        # and the generic Fp8Config gate. The SM70 FP8 format routes serialized
+        # weights through TurboMind W8A16 (exact SM70/72) or the Turing QPN8
+        # kernel (SM75); a forced Marlin backend keeps the FP8-Marlin
+        # weight-only GEMM (capability 7.0+). Each route re-validates
+        # operators, scales, and dtypes at weight preparation, and per-device
+        # routing stays in ModelOptFp8LinearMethod.
+        if sm70_tm.is_pre_ampere_cuda_platform() and (
+            sm70_tm.format_enabled("fp8") or sm70_tm.forces_marlin()
+        ):
+            return 70
         return 89
 
     @classmethod
