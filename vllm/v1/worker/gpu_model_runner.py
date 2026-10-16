@@ -793,10 +793,12 @@ def _e5_fast_prepare_v2(self, scheduler_output):
     self._compute_prev_positions(num_reqs)
     prev_req_id_to_index = self.input_batch.prev_req_id_to_index
     if self.num_accepted_tokens_event is not None:
+        _e5p_h(self, "H1")
         self._event_tracer.synchronize(
             self.num_accepted_tokens_event,
             "GPUModelRunner.num_accepted_tokens_event.synchronize",
         )
+        _e5p_h(self, "H2")
         self._sync_mamba_accepted_token_state(so, num_reqs)
         self.num_accepted_tokens.np[num_reqs:].fill(1)
         self.spec_state_slot_selectors.np[num_reqs:].fill(1)
@@ -999,6 +1001,283 @@ def _e5_prep_verify(self, scheduler_output, num_scheduled_tokens_np):
             seen.add(path)
             logger.info("[e5v2-verify] MISMATCH %s %s", path, note)
     return logits_indices, spec_md
+
+
+# ---- E5 phase profiler (VLLM_SM70_E5_PROF=<rounds>) -------------------------
+# Ported from the v100-skinny fork. Boundary ledger for the steady round:
+# host stamps H0 (execute entry), H1->H2 (accepted-event wait), H4 (prepare
+# done), H5 (verify submitted), H6 (draft window done); GPU events G0 (verify
+# start) -> G1 (verify end) -> G2 (rejection done) -> G4 (drafter tail done);
+# bubble = prev-G4 -> G0. Events harvested 16 rounds late — no syncs are
+# added to the round.
+_E5_PROF = int(os.getenv("VLLM_SM70_E5_PROF", "0") or "0")
+_E5P_POOL = 32
+_E5P_LAG = 16
+
+# NVTX phase brackets (VLLM_SM70_E5_NVTX=1) — pushed on the same four G
+# markers so an nsys capture can attribute every GPU kernel to verify /
+# rejection / drafter. Independent of _E5_PROF's round budget, and armed only
+# on the clean steady round shape (1 request, k+1 scheduled tokens).
+_E5_NVTX = os.getenv("VLLM_SM70_E5_NVTX", "0") == "1"
+_E5_NVTX_LABELS = ("vfy", "rej", "drf")
+
+
+def _e5p_nvtx_mark(self, idx: int) -> None:
+    """Open/close the NVTX range for phase `idx`; self-balancing.
+
+    G0 opens "vfy", G1 closes it and opens "rej", G2 closes that and opens
+    "drf", G3 closes "drf". A round that never reaches G3 is closed by the
+    next G0, so pushes and pops always pair.
+    """
+    if not getattr(self, "_e5p_nvtx_arm", False):
+        return
+    open_idx = getattr(self, "_e5p_nvtx_open", None)
+    if idx == 0:
+        if open_idx is not None:
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(_E5_NVTX_LABELS[0])
+        self._e5p_nvtx_open = 0
+        return
+    if open_idx != idx - 1:
+        return
+    torch.cuda.nvtx.range_pop()
+    self._e5p_nvtx_open = None
+    if idx < len(_E5_NVTX_LABELS):
+        torch.cuda.nvtx.range_push(_E5_NVTX_LABELS[idx])
+        self._e5p_nvtx_open = idx
+
+
+def _e5p(self):
+    st = getattr(self, "_e5p_state", None)
+    if st is None:
+        st = {
+            "pool": [
+                tuple(torch.cuda.Event(enable_timing=True) for _ in range(4))
+                for _ in range(_E5P_POOL)
+            ],
+            "pend": [],
+            "recs": [],
+            "i": 0,
+            "cur": None,
+            "done": False,
+        }
+        self._e5p_state = st
+    return st
+
+
+def _e5p_begin(self, scheduler_output) -> None:
+    if _E5_NVTX:
+        self._e5p_nvtx_arm = (
+            scheduler_output.total_num_scheduled_tokens
+            == self.num_spec_tokens + 1
+            and self.input_batch.num_reqs == 1
+        )
+    if not _E5_PROF:
+        return
+    st = _e5p(self)
+    if st["done"]:
+        return
+    while st["pend"] and st["pend"][0]["i"] <= st["i"] - _E5P_LAG:
+        _e5p_harvest(self, st["pend"].pop(0))
+    if (scheduler_output.total_num_scheduled_tokens
+            != self.num_spec_tokens + 1
+            or self.input_batch.num_reqs != 1):
+        st["cur"] = None
+        return
+    slot = st["i"] % _E5P_POOL
+    prev_slot = (st["i"] - 1) % _E5P_POOL
+    st["cur"] = {
+        "i": st["i"],
+        "ev": st["pool"][slot],
+        "prev_g4": st["pool"][prev_slot][3] if st["i"] > 0 else None,
+        "H0": time.perf_counter(),
+    }
+
+
+def _e5p_h(self, key: str) -> None:
+    if not _E5_PROF:
+        return
+    st = getattr(self, "_e5p_state", None)
+    if st and st["cur"] is not None:
+        st["cur"][key] = time.perf_counter()
+
+
+def _e5p_g(self, idx: int) -> None:
+    if _E5_NVTX:
+        _e5p_nvtx_mark(self, idx)
+    if not _E5_PROF:
+        return
+    st = getattr(self, "_e5p_state", None)
+    if st and st["cur"] is not None:
+        st["cur"]["ev"][idx].record()
+
+
+def _e5p_finish(self) -> None:
+    if not _E5_PROF:
+        return
+    st = getattr(self, "_e5p_state", None)
+    if not st or st["cur"] is None:
+        return
+    st["cur"]["H6"] = time.perf_counter()
+    if _E5_SUBPROF and st["i"] % _E5_SUB_EVERY == 5:
+        _e5p_sub_snapshot(self, st["cur"])
+    st["pend"].append(st["cur"])
+    st["cur"] = None
+    st["i"] += 1
+
+
+# ---- G0->G1 sub-profile (VLLM_SM70_E5_SUBPROF=1, needs AR_EVT + PROF) ------
+# The AR instrument bakes 150 event pairs inside the verify graph in
+# execution order; post[k-1]->post[k] segments plus head (G0->post0) and
+# tail (post149->G1) partition G0G1 exactly. Baked events re-record every
+# replay, so sampled rounds synchronize (inside the bubble) and read the
+# whole partition from that round.
+_E5_SUBPROF = os.getenv("VLLM_SM70_E5_SUBPROF", "0") == "1"
+_E5_SUB_EVERY = 16
+_E5_SUB_MAX = 40
+
+
+def _e5p_sub_snapshot(self, rec) -> None:
+    st = self._e5p_state
+    subs = st.setdefault("subs", [])
+    if len(subs) >= _E5_SUB_MAX:
+        return
+    try:
+        from vllm.distributed.device_communicators import (
+            custom_all_reduce as _car,
+        )
+        pairs = [t for t in getattr(_car, "_AR_GRAPH_PAIRS", [])
+                 if len(t) == 3 and tuple(t[2])[:1] == (8,)]
+        if not pairs:
+            return
+        if not st.get("pairs_logged"):
+            st["pairs_logged"] = True
+            logger.info("[e5p-sub] shape-8 pairs total=%d", len(pairs))
+        # The AOT warmup pass bakes a first, later-destroyed capture whose
+        # events are dead handles; the live graph's pairs are the tail run.
+        if len(pairs) > 160:
+            pairs = pairs[-150:]
+        stage = "sync"
+        torch.cuda.set_device(self.device)
+        torch.cuda.synchronize()
+        # Baked external events throw invalid-resource-handle
+        # intermittently (the daemon harvest silently tolerates the same);
+        # collect per-segment with per-call tolerance and track coverage.
+        pre0 = pairs[0][0]
+        posts = [t[1] for t in pairs]
+        stage = "seg-loop"
+
+        def _el(a, b):
+            try:
+                v = a.elapsed_time(b)
+                return v if -0.5 < v < 50.0 else None
+            except Exception:
+                return None
+
+        segs = [_el(pre0, posts[0])]
+        for a, b in zip(posts, posts[1:]):
+            segs.append(_el(a, b))
+        total = _el(pre0, posts[-1])
+        ok = sum(1 for x in segs if x is not None)
+        st.setdefault("cov", []).append(ok)
+        if ok >= len(segs) - 8:
+            subs.append((total, segs))
+        if len(subs) == _E5_SUB_MAX:
+            _e5p_sub_report(self)
+    except Exception as exc:
+        import traceback
+        frames = [ln.strip() for ln in traceback.format_exc().splitlines()
+                  if ln.strip().startswith("File")]
+        logger.info(
+            "[e5p-sub] FAIL stage=%s %s :: %s",
+            locals().get("stage", "?"), type(exc).__name__,
+            " :: ".join(frames[-2:]),
+        )
+
+
+def _e5p_sub_report(self) -> None:
+    import statistics as _st
+    subs = self._e5p_state["subs"]
+    n_seg = min(len(s) for _, s in subs)
+    med = []
+    for i in range(n_seg):
+        vs = [s[i] for _, s in subs if s[i] is not None]
+        med.append(_st.median(vs) if vs else 0.0)
+    totals = [t for t, _ in subs if t is not None]
+    total = _st.median(totals) if totals else sum(med)
+    head = med[0]
+    body = med[1:]
+    order = sorted(range(len(body)), key=lambda i: -body[i])[:10]
+    top = " ".join(f"{i}:{body[i]:.3f}" for i in order)
+    evens = sum(v for i, v in enumerate(body) if i % 2 == 0)
+    odds = sum(v for i, v in enumerate(body) if i % 2 == 1)
+    cum = []
+    acc = head
+    marks = {24, 49, 74, 99, 124}
+    for i, v in enumerate(body):
+        acc += v
+        if i in marks:
+            cum.append(f"c{i + 1}={acc:.2f}")
+    logger.info(
+        "[e5p-sub] n=%d G0G1=%.2f sum=%.2f ar0=%.3f nseg=%d "
+        "even_sum=%.2f odd_sum=%.2f seg_med=%.3f seg_max=%.3f %s top10[%s]",
+        len(subs), total, sum(med), head, len(body), evens, odds,
+        _st.median(body), max(body), " ".join(cum), top,
+    )
+
+
+def _e5p_harvest(self, rec) -> None:
+    st = self._e5p_state
+    out = {"H0": rec["H0"]}
+    for a, b, name in (("H0", "H1", "H0H1"), ("H1", "H2", "H1H2"),
+                       ("H2", "H4", "H2H4"), ("H4", "H5", "H4H5"),
+                       ("H5", "H6", "H5H6")):
+        if a in rec and b in rec:
+            out[name] = (rec[b] - rec[a]) * 1000.0
+    try:
+        e = rec["ev"]
+        if all(x.query() for x in e):
+            out["G0G1"] = e[0].elapsed_time(e[1])
+            out["G1G2"] = e[1].elapsed_time(e[2])
+            out["G2G4"] = e[2].elapsed_time(e[3])
+            if rec["prev_g4"] is not None and rec["prev_g4"].query():
+                out["bubble"] = rec["prev_g4"].elapsed_time(e[0])
+    except Exception:
+        pass
+    st["recs"].append(out)
+    if len(st["recs"]) >= _E5_PROF and not st["done"]:
+        st["done"] = True
+        _e5p_report(self)
+
+
+def _e5p_report(self) -> None:
+    import statistics as _st
+    recs = self._e5p_state["recs"]
+    walls = [
+        (b["H0"] - a["H0"]) * 1000.0
+        for a, b in zip(recs, recs[1:])
+        if 0.0 < (b["H0"] - a["H0"]) * 1000.0 < 200.0
+    ]
+    parts = [f"n={len(recs)}"]
+    if walls:
+        parts.append(f"wall={_st.median(walls):.2f}"
+                     f"/p95={sorted(walls)[int(len(walls) * 0.95)]:.2f}")
+    subs = self._e5p_state.get("subs")
+    cov = self._e5p_state.get("cov")
+    if cov:
+        import statistics as _sst
+        logger.info(
+            "[e5p-sub] coverage: tries=%d full=%d med_ok=%.0f",
+            len(cov), len(subs or []), _sst.median(cov),
+        )
+    if subs and len(subs) >= 4:
+        _e5p_sub_report(self)
+    for k in ("H0H1", "H1H2", "H2H4", "H4H5", "H5H6",
+              "G0G1", "G1G2", "G2G4", "bubble"):
+        vs = [r[k] for r in recs if k in r]
+        if vs:
+            parts.append(f"{k}={_st.median(vs):.2f}")
+    logger.info("[e5p] %s", " ".join(parts))
 
 
 def _e5_serve_family(self, fresh_md):
@@ -5551,10 +5830,12 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         profile_stage_t0 = time.perf_counter() if profile_inputs else 0.0
         if self.num_accepted_tokens_event is not None:
+            _e5p_h(self, "H1")
             self._event_tracer.synchronize(
                 self.num_accepted_tokens_event,
                 "GPUModelRunner.num_accepted_tokens_event.synchronize",
             )
+            _e5p_h(self, "H2")
             self._sync_mamba_accepted_token_state(scheduler_output, num_reqs)
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.spec_state_slot_selectors.np[num_reqs:].fill(1)
@@ -9079,6 +9360,7 @@ class GPUModelRunner(
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
+            _e5p_begin(self, scheduler_output)
             _e5_hit = _E5_CACHE and _e5_md_hit(self, scheduler_output)
             _e5_v2 = (_E5_V2 and _e5_hit
                       and "spec_md" in self._e5_cache_state)
@@ -9435,6 +9717,7 @@ class GPUModelRunner(
                     } if isinstance(attn_metadata, dict) else attn_metadata,
                 })
 
+        _e5p_h(self, "H4")
         if trace_log:
             trace_preprocess_ms = (time.perf_counter() - trace_preprocess_t0) * 1000.0
 
@@ -9477,6 +9760,7 @@ class GPUModelRunner(
             else None
         )
         mtp_forward_start = self._step_profiler.start(mtp_profile_events)
+        _e5p_g(self, 0)
         trace_forward_t0 = time.perf_counter() if trace_log else 0.0
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.prepare_forward(
@@ -9517,6 +9801,8 @@ class GPUModelRunner(
             )
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
+        _e5p_g(self, 1)
+        _e5p_h(self, "H5")
         _e5_post_args = getattr(self, "_e5_post_args", None)
         if _e5_post_args is not None:
             self._e5_post_args = None
@@ -9807,6 +10093,7 @@ class GPUModelRunner(
                 else "target_sample_no_spec",
                 mtp_sample_start,
             )
+            _e5p_g(self, 2)
             if trace_log:
                 trace_sample_ms = (time.perf_counter() - trace_sample_t0) * 1000.0
 
@@ -9986,6 +10273,8 @@ class GPUModelRunner(
                     mtp_profile_ctx, "draft_wall_cpu", mtp_draft_wall_start
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                _e5p_g(self, 3)
+                _e5p_finish(self)
                 if trace_log:
                     trace_draft_ms += (time.perf_counter() - trace_draft_t0) * 1000.0
 
