@@ -1002,9 +1002,9 @@ struct FilteredTopKTraits<float> {
 
 constexpr uint32_t FILTERED_TOPK_BLOCK_THREADS = 1024;
 constexpr uint32_t FILTERED_TOPK_SMEM_INPUT_SIZE =
-    4 * 1024;  // 4K indices per buffer (32KB dynamic; fits 96KB V100 smem)
+    8 * 1024;  // 8K indices per buffer (64KB dynamic; fits 96KB V100 smem)
 constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
-    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 32KB
+    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 64KB
 
 /*!
  * \brief Filtered Top-K kernel for ragged sequences.
