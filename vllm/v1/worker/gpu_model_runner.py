@@ -9363,7 +9363,8 @@ class GPUModelRunner(
             _e5p_begin(self, scheduler_output)
             _e5_hit = _E5_CACHE and _e5_md_hit(self, scheduler_output)
             _e5_v2 = (_E5_V2 and _e5_hit
-                      and "spec_md" in self._e5_cache_state)
+                      and "spec_md" in self._e5_cache_state
+                      and self._draft_token_ids is not None)
             if _e5_v2 and not _E5_VERIFY:
                 logits_indices, spec_decode_metadata = _e5_fast_prepare_v2(
                     self, scheduler_output
