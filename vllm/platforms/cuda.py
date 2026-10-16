@@ -740,7 +740,11 @@ class NvmlCudaPlatform(CudaPlatformBase):
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
             return DeviceCapability(major=major, minor=minor)
-        except RuntimeError:
+        except Exception:
+            # pynvml.NVMLError is not a RuntimeError; on DGXS-style boxes the
+            # NVML index space is sparse (a single GPU at PCI index 1 leaves
+            # handle 0 raising NVMLError_Unknown), so any NVML failure must
+            # degrade to "unknown capability", never raise past here.
             return None
 
     @classmethod
@@ -752,7 +756,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
     ) -> bool:
         try:
             return super().has_device_capability(capability, device_id)
-        except RuntimeError:
+        except Exception:
             return False
 
     @classmethod
